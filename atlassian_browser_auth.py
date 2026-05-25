@@ -76,8 +76,15 @@ class BrowserAuthConfig:
             )
         ).expanduser().resolve()
 
+        def _is_under(path: Path, parent: Path) -> bool:
+            try:
+                path.relative_to(parent)
+                return True
+            except ValueError:
+                return False
+
         for label, path in [("ATLASSIAN_BROWSER_PROFILE_DIR", profile_dir), ("ATLASSIAN_STORAGE_STATE", storage_state)]:
-            if not (str(path).startswith(str(base_dir)) or str(path).startswith(str(home))):
+            if not (_is_under(path, base_dir) or _is_under(path, home)):
                 raise ValueError(
                     f"{label} resolves to '{path}' which is outside the project "
                     f"directory and user home. Refusing to use it."
@@ -128,11 +135,8 @@ class BrowserAuthConfig:
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https"):
             return False
-        for base in (self.jira_url, self.confluence_url, self.jira_login_url, self.confluence_login_url):
-            base_parsed = urlparse(base)
-            if parsed.hostname == base_parsed.hostname:
-                return True
-        return False
+        allowed_hosts = {urlparse(u).hostname for u in (self.jira_url, self.confluence_url)}
+        return parsed.hostname in allowed_hosts
 
 
 def _wait_for_any_selector(
@@ -184,6 +188,14 @@ def interactive_login(
     config: BrowserAuthConfig | None = None,
 ) -> dict[str, Any]:
     cfg = config or BrowserAuthConfig.from_env()
+
+    for label, path in [("profile_dir", cfg.profile_dir), ("storage_state", cfg.storage_state)]:
+        if path.is_symlink():
+            raise RuntimeError(
+                f"{label} path '{path}' is a symlink. "
+                "Refusing to follow — possible local symlink attack."
+            )
+
     cfg.profile_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     cfg.profile_dir.chmod(stat.S_IRWXU)
     cfg.storage_state.parent.mkdir(parents=True, exist_ok=True)
@@ -253,8 +265,19 @@ def interactive_login(
 
 
 def _load_storage_state(path: Path) -> dict[str, Any]:
+    if path.is_symlink():
+        raise RuntimeError(
+            f"Storage state file '{path}' is a symlink. "
+            "Refusing to follow — possible local symlink attack."
+        )
     try:
-        file_stat = path.stat()
+        fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW)
+    except FileNotFoundError as exc:
+        raise RuntimeError(
+            f"Browser storage state does not exist yet: {path}"
+        ) from exc
+    try:
+        file_stat = os.fstat(fd)
         if file_stat.st_uid != os.getuid():
             raise RuntimeError(
                 f"Storage state file '{path}' is owned by uid {file_stat.st_uid}, "
@@ -267,12 +290,11 @@ def _load_storage_state(path: Path) -> dict[str, Any]:
                 file=sys.stderr,
                 flush=True,
             )
-            path.chmod(stat.S_IRUSR | stat.S_IWUSR)
-        return json.loads(path.read_text())
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            f"Browser storage state does not exist yet: {path}"
-        ) from exc
+            os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        data = os.read(fd, file_stat.st_size + 1)
+        return json.loads(data)
+    finally:
+        os.close(fd)
 
 
 def _cookie_matches_base_url(cookie: dict[str, Any], base_url: str) -> bool:
