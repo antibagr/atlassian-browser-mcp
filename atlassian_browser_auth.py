@@ -231,21 +231,31 @@ def interactive_login(
             )
             page = context.pages[0] if context.pages else context.new_page()
 
+            def _is_authenticated_url(url: str) -> bool:
+                if not url.startswith((cfg.jira_url, cfg.confluence_url)):
+                    return False
+                if "permissionViolation=true" in url:
+                    return False
+                path = urlparse(url).path or ""
+                login_paths = ("/login.action", "/login.jsp", "/loginpage.action",
+                               "/secure/Logon", "/authenticate")
+                return not any(path.startswith(p) or path.endswith(p) for p in login_paths)
+
             def _check_and_save() -> dict[str, Any] | None:
                 try:
                     url = page.url
                 except Error:
                     return None
-                if url.startswith((cfg.jira_url, cfg.confluence_url)):
-                    context.storage_state(path=str(cfg.storage_state))
-                    cfg.storage_state.chmod(stat.S_IRUSR | stat.S_IWUSR)
-                    return {
-                        "status": "ok",
-                        "service": service,
-                        "final_url": url,
-                        "storage_state": str(cfg.storage_state),
-                    }
-                return None
+                if not _is_authenticated_url(url):
+                    return None
+                context.storage_state(path=str(cfg.storage_state))
+                cfg.storage_state.chmod(stat.S_IRUSR | stat.S_IWUSR)
+                return {
+                    "status": "ok",
+                    "service": service,
+                    "final_url": url,
+                    "storage_state": str(cfg.storage_state),
+                }
 
             page.on("framenavigated", lambda _: None)
             try:
