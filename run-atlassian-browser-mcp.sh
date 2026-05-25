@@ -26,7 +26,17 @@ then
   uv pip install --python "${PYTHON_BIN}" -e "${ROOT_DIR}"
 fi
 
-"${PYTHON_BIN}" -m playwright install chromium >/dev/null
+# Only install Chromium if the browser executable is missing
+if ! "${PYTHON_BIN}" -c "
+from playwright.sync_api import sync_playwright
+pw = sync_playwright().start()
+try:
+    pw.chromium.executable_path
+finally:
+    pw.stop()
+" >/dev/null 2>&1; then
+  "${PYTHON_BIN}" -m playwright install chromium >/dev/null
+fi
 
 # Startup compatibility assertion: verify the upstream version and patched signatures
 "${PYTHON_BIN}" - <<'PY'

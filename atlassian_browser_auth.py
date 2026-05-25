@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 import stat
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import requests
 from playwright.sync_api import Error, TimeoutError, sync_playwright
@@ -61,22 +61,34 @@ class BrowserAuthConfig:
         jira_url = os.environ["JIRA_URL"].rstrip("/")
         confluence_url = os.environ["CONFLUENCE_URL"].rstrip("/")
         base_dir = Path(__file__).resolve().parent
+        home = Path.home()
+
+        profile_dir = Path(
+            os.environ.get(
+                "ATLASSIAN_BROWSER_PROFILE_DIR",
+                str(base_dir / ".atlassian-browser-profile"),
+            )
+        ).expanduser().resolve()
+        storage_state = Path(
+            os.environ.get(
+                "ATLASSIAN_STORAGE_STATE",
+                str(base_dir / ".atlassian-browser-state.json"),
+            )
+        ).expanduser().resolve()
+
+        for label, path in [("ATLASSIAN_BROWSER_PROFILE_DIR", profile_dir), ("ATLASSIAN_STORAGE_STATE", storage_state)]:
+            if not (str(path).startswith(str(base_dir)) or str(path).startswith(str(home))):
+                raise ValueError(
+                    f"{label} resolves to '{path}' which is outside the project "
+                    f"directory and user home. Refusing to use it."
+                )
+
         return cls(
             jira_url=jira_url,
             confluence_url=confluence_url,
             username=os.environ.get("ATLASSIAN_USERNAME"),
-            profile_dir=Path(
-                os.environ.get(
-                    "ATLASSIAN_BROWSER_PROFILE_DIR",
-                    str(base_dir / ".atlassian-browser-profile"),
-                )
-            ).expanduser(),
-            storage_state=Path(
-                os.environ.get(
-                    "ATLASSIAN_STORAGE_STATE",
-                    str(base_dir / ".atlassian-browser-state.json"),
-                )
-            ).expanduser(),
+            profile_dir=profile_dir,
+            storage_state=storage_state,
             channel=os.environ.get("ATLASSIAN_BROWSER_CHANNEL", "chromium"),
             login_timeout_seconds=int(
                 os.environ.get("ATLASSIAN_LOGIN_TIMEOUT_SECONDS", "300")
@@ -102,6 +114,14 @@ class BrowserAuthConfig:
 
     def login_target(self, service: ServiceName) -> str:
         return self.jira_login_url if service == "jira" else self.confluence_login_url
+
+    @staticmethod
+    def redact_url(url: str) -> str:
+        """Strip query and fragment from URLs to avoid logging SAML tokens."""
+        parsed = urlparse(url)
+        if parsed.query or parsed.fragment:
+            return urlunparse(parsed._replace(query="<redacted>", fragment=""))
+        return url
 
     def is_allowed_url(self, url: str) -> bool:
         """Reject URLs that don't belong to configured Jira/Confluence instances."""
@@ -206,7 +226,7 @@ def interactive_login(
                 current_url = page.url
                 if current_url != last_url:
                     print(
-                        f"[atlassian-browser-auth] Browser now at: {current_url}",
+                        f"[atlassian-browser-auth] Browser now at: {BrowserAuthConfig.redact_url(current_url)}",
                         file=sys.stderr,
                         flush=True,
                     )
@@ -228,12 +248,26 @@ def interactive_login(
             context.close()
             raise RuntimeError(
                 "Timed out waiting for Atlassian login to complete. "
-                f"Last page: {current_url}"
+                f"Last page: {BrowserAuthConfig.redact_url(current_url)}"
             )
 
 
 def _load_storage_state(path: Path) -> dict[str, Any]:
     try:
+        file_stat = path.stat()
+        if file_stat.st_uid != os.getuid():
+            raise RuntimeError(
+                f"Storage state file '{path}' is owned by uid {file_stat.st_uid}, "
+                f"not the current user (uid {os.getuid()}). Possible tampering."
+            )
+        if file_stat.st_mode & (stat.S_IRGRP | stat.S_IROTH):
+            print(
+                f"[atlassian-browser-auth] WARNING: '{path}' is readable by "
+                "group/others. Tightening permissions to 600.",
+                file=sys.stderr,
+                flush=True,
+            )
+            path.chmod(stat.S_IRUSR | stat.S_IWUSR)
         return json.loads(path.read_text())
     except FileNotFoundError as exc:
         raise RuntimeError(
@@ -244,7 +278,11 @@ def _load_storage_state(path: Path) -> dict[str, Any]:
 def _cookie_matches_base_url(cookie: dict[str, Any], base_url: str) -> bool:
     hostname = urlparse(base_url).hostname or ""
     domain = (cookie.get("domain") or "").lstrip(".")
-    return bool(domain) and (hostname == domain or hostname.endswith(f".{domain}"))
+    if not domain:
+        return False
+    # Exact hostname match only — reject broad domain cookies (e.g. ".epam.com")
+    # to prevent leaking SSO IdP cookies with Jira API requests.
+    return hostname == domain
 
 
 def _apply_storage_state_cookies(
@@ -279,7 +317,9 @@ def _load_sso_markers() -> tuple[str, ...]:
     """Load SSO detection markers from env or use sensible defaults."""
     custom = os.environ.get("ATLASSIAN_SSO_MARKERS")
     if custom:
-        return tuple(m.strip() for m in custom.split(",") if m.strip())
+        parsed = tuple(m.strip() for m in custom.split(",") if m.strip())
+        if parsed:
+            return parsed
     return (
         "oauth2/authorize",
         "The page has timed out",
@@ -323,16 +363,17 @@ class BrowserCookieSession(requests.Session):
         self.base_url = base_url.rstrip("/")
         self.browser_config = config or BrowserAuthConfig.from_env()
         self.trust_env = False
+        self.max_redirects = 5
         self.headers.update({"User-Agent": self.browser_config.user_agent})
+        self._browser_retry_on_auth = True
         try:
             self.refresh_cookies()
-        except Exception:
-            print(
-                f"[atlassian-browser-auth] Could not load browser cookies for {service}; "
-                "session will start without authentication",
-                file=sys.stderr,
-                flush=True,
-            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"[atlassian-browser-auth] Could not load browser cookies for {service}. "
+                "Refusing to proceed without authentication. Run atlassian_login first "
+                "or check your storage state file."
+            ) from exc
 
     def refresh_cookies(self) -> None:
         if not self.browser_config.storage_state.exists():
@@ -345,19 +386,16 @@ class BrowserCookieSession(requests.Session):
         _apply_storage_state_cookies(self, storage_state, self.base_url)
 
     def request(self, method: str, url: str, *args: Any, **kwargs: Any) -> requests.Response:
-        retry_on_auth = kwargs.pop("_retry_on_auth", True)
         response = super().request(method, url, *args, **kwargs)
-        if retry_on_auth and looks_like_sso_response(response):
+        if self._browser_retry_on_auth and looks_like_sso_response(response):
             response.close()
-            interactive_login(self.service, config=self.browser_config)
-            self.refresh_cookies()
-            return self.request(
-                method,
-                url,
-                *args,
-                _retry_on_auth=False,
-                **kwargs,
-            )
+            self._browser_retry_on_auth = False
+            try:
+                interactive_login(self.service, config=self.browser_config)
+                self.refresh_cookies()
+                return super().request(method, url, *args, **kwargs)
+            finally:
+                self._browser_retry_on_auth = True
         return response
 
 
