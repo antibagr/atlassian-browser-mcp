@@ -230,31 +230,42 @@ def interactive_login(
                 viewport={"width": 1440, "height": 960},
             )
             page = context.pages[0] if context.pages else context.new_page()
-            page.goto(target_url, wait_until="domcontentloaded")
-            _best_effort_prefill(page, cfg.username)
 
-            last_url = page.url
-            while time.time() < deadline:
-                current_url = page.url
-                if current_url != last_url:
-                    print(
-                        f"[atlassian-browser-auth] Browser now at: {BrowserAuthConfig.redact_url(current_url)}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    last_url = current_url
-
-                if current_url.startswith((cfg.jira_url, cfg.confluence_url)):
+            def _check_and_save() -> dict[str, Any] | None:
+                try:
+                    url = page.url
+                except Error:
+                    return None
+                if url.startswith((cfg.jira_url, cfg.confluence_url)):
                     context.storage_state(path=str(cfg.storage_state))
                     cfg.storage_state.chmod(stat.S_IRUSR | stat.S_IWUSR)
-                    context.close()
                     return {
                         "status": "ok",
                         "service": service,
-                        "final_url": current_url,
+                        "final_url": url,
                         "storage_state": str(cfg.storage_state),
                     }
-                time.sleep(1)
+                return None
+
+            page.on("framenavigated", lambda _: None)
+            try:
+                page.goto(target_url, wait_until="commit", timeout=3000)
+            except (TimeoutError, Error):
+                pass
+
+            result = _check_and_save()
+            if result:
+                context.close()
+                return result
+
+            _best_effort_prefill(page, cfg.username)
+
+            while time.time() < deadline:
+                result = _check_and_save()
+                if result:
+                    context.close()
+                    return result
+                time.sleep(0.5)
 
             current_url = page.url
             context.close()

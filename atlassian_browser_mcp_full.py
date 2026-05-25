@@ -252,7 +252,7 @@ FormsApiMixin._make_forms_api_request = _patch_forms_api_request
 
 
 @main_mcp.tool()
-def atlassian_login(
+async def atlassian_login(
     target: Literal["jira", "confluence"] = "jira",
     url: str | None = None,
 ) -> dict[str, Any]:
@@ -262,6 +262,8 @@ def atlassian_login(
     Atlassian hostnames (JIRA_URL or CONFLUENCE_URL).  Arbitrary URLs
     are rejected to prevent phishing through MCP tool calls.
     """
+    import asyncio
+
     if url is not None:
         cfg = BrowserAuthConfig.from_env()
         if not cfg.is_allowed_url(url):
@@ -273,7 +275,8 @@ def atlassian_login(
                 ),
             }
 
-    return interactive_login(target, url)
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, interactive_login, target, url)
 
 
 def main() -> None:
