@@ -14,6 +14,7 @@ from atlassian import Confluence, Jira
 from requests.exceptions import HTTPError
 
 from atlassian_browser_auth import (
+    BrowserAuthConfig,
     browser_auth_enabled,
     create_browser_session,
     interactive_login,
@@ -22,8 +23,11 @@ from atlassian_browser_auth import (
 # Make the upstream server expose its complete tool surface.
 os.environ.setdefault("TOOLSETS", "all")
 os.environ.setdefault("ATLASSIAN_BROWSER_AUTH_ENABLED", "true")
-os.environ.setdefault("JIRA_PERSONAL_TOKEN", "BROWSER_SESSION")
-os.environ.setdefault("CONFLUENCE_PERSONAL_TOKEN", "BROWSER_SESSION")
+# Upstream requires these env vars to be set but we never send them as tokens.
+# Use a sentinel that is clearly not a real token to satisfy the check.
+_BROWSER_AUTH_SENTINEL = "BROWSER_AUTH_NO_TOKEN"
+os.environ.setdefault("JIRA_PERSONAL_TOKEN", _BROWSER_AUTH_SENTINEL)
+os.environ.setdefault("CONFLUENCE_PERSONAL_TOKEN", _BROWSER_AUTH_SENTINEL)
 
 from mcp_atlassian.confluence.client import ConfluenceClient
 from mcp_atlassian.confluence.config import ConfluenceConfig
@@ -252,7 +256,22 @@ def atlassian_login(
     target: Literal["jira", "confluence"] = "jira",
     url: str | None = None,
 ) -> dict[str, Any]:
-    """Launch a visible browser and wait for manual SSO / MFA login."""
+    """Launch a visible browser and wait for manual SSO / MFA login.
+
+    The `url` parameter, if provided, MUST match one of the configured
+    Atlassian hostnames (JIRA_URL or CONFLUENCE_URL).  Arbitrary URLs
+    are rejected to prevent phishing through MCP tool calls.
+    """
+    if url is not None:
+        cfg = BrowserAuthConfig.from_env()
+        if not cfg.is_allowed_url(url):
+            return {
+                "status": "error",
+                "message": (
+                    f"Refused: '{url}' does not match configured Atlassian hosts. "
+                    "Only JIRA_URL and CONFLUENCE_URL hostnames are allowed."
+                ),
+            }
 
     return interactive_login(target, url)
 

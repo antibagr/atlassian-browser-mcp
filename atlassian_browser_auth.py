@@ -11,6 +11,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
+import stat
 from urllib.parse import urlparse
 
 import requests
@@ -102,6 +103,17 @@ class BrowserAuthConfig:
     def login_target(self, service: ServiceName) -> str:
         return self.jira_login_url if service == "jira" else self.confluence_login_url
 
+    def is_allowed_url(self, url: str) -> bool:
+        """Reject URLs that don't belong to configured Jira/Confluence instances."""
+        parsed = urlparse(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        for base in (self.jira_url, self.confluence_url, self.jira_login_url, self.confluence_login_url):
+            base_parsed = urlparse(base)
+            if parsed.hostname == base_parsed.hostname:
+                return True
+        return False
+
 
 def _wait_for_any_selector(
     page, selectors: list[str], timeout_ms: int = 1800
@@ -152,9 +164,17 @@ def interactive_login(
     config: BrowserAuthConfig | None = None,
 ) -> dict[str, Any]:
     cfg = config or BrowserAuthConfig.from_env()
-    cfg.profile_dir.mkdir(parents=True, exist_ok=True)
+    cfg.profile_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    cfg.profile_dir.chmod(stat.S_IRWXU)
     cfg.storage_state.parent.mkdir(parents=True, exist_ok=True)
     target_url = url or cfg.login_target(service)
+
+    if url is not None and not cfg.is_allowed_url(url):
+        raise ValueError(
+            f"Refusing to open URL '{url}' — it does not match any configured "
+            f"Atlassian host ({cfg.jira_url}, {cfg.confluence_url}). "
+            "This restriction prevents phishing via MCP tool calls."
+        )
 
     with _LOGIN_LOCK:
         print(
@@ -194,6 +214,7 @@ def interactive_login(
 
                 if current_url.startswith((cfg.jira_url, cfg.confluence_url)):
                     context.storage_state(path=str(cfg.storage_state))
+                    cfg.storage_state.chmod(stat.S_IRUSR | stat.S_IWUSR)
                     context.close()
                     return {
                         "status": "ok",
